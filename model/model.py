@@ -11,7 +11,6 @@ class MokioMindConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 512,
-        intermediate_size: int = None,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -89,6 +88,178 @@ class RMSnorm(nn.Module):
     def forward(self,x):
         return self.weight*self._norm(x.float()).type_as(x)  # 半精度训练容易溢出
                                                             # float32全精度更稳定，但结束后记得返回float16
+
+
+
+def pre_compute_cis(end,dim,base=1e6,rope_scaling=None):
+    # 先计算角频率0-dim//2个
+    freqs=1.0/(base**torch.arange(0,dim,2).float()/dim)
+    seq_idx=torch.arange(0,end,device=freqs.device)
+    # 计算corr_dim
+    if rope_scaling is not None:
+        original_max,beta_fast,beta_slow,factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("beta_fast", 4),
+            rope_scaling.get("beta_slow", 1),
+            rope_scaling.get("factor", 4)
+        )
+
+        corr_dim=next((i for i in range(0,dim//2) if 2*torch.pi/freqs[i]>original_max),dim//2)
+        
+        # 计算scale
+        power=torch.arange(0,dim//2,device=freqs.device).float()/max(dim//2,1)
+        beta=beta_slow+(beta_fast-beta_slow)*power
+        scale=torch.where(
+            torch.arange(0,dim//2,device=freqs.device)<corr_dim,
+            (beta*factor-beta+1)/(beta*factor),
+            1.0/factor
+        )
+        # 角度乘上scale计算后续
+        freqs=freqs*scale
+    idx_freqs=torch.outer(seq_idx,freqs)
+    idx_freqs2=torch.cat([idx_freqs,idx_freqs],dim=1)
+    freqs_cos=idx_freqs2.cos()[None,:,None,:]
+    freqs_sin=idx_freqs2.sin()[None,:,None,:]
+    return freqs_cos,freqs_sin
+
+def rota_half(x):
+    dim=x.shape[-1]
+    x1=x[...,:dim//2]
+    x2=x[...,dim//2:]
+    return torch.cat([-x2,x1],dim=-1)
+# 进来的是分完头（batch_size,seq_len,num_heads,head_dim)
+def apply_rotary_pos_emb(q,k,freqs_cos,freqs_sin):
+    q_embed=q*freqs_cos+rota_half(q)*freqs_sin
+    k_embed=k*freqs_cos+rota_half(k)*freqs_sin
+    return q_embed,k_embed
+# 将1/n_rep的kv重复n_rep次
+def repeat_kv(x,n_rep):
+    if n_rep==1:
+        return x
+    else:   # 可以用expend和reshape优化计算速度
+        x=torch.repeat_interleave(x,n_rep,dim=2)
+        return x
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
