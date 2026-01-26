@@ -77,12 +77,13 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 from torch import nn
-
+from transformers.activations import ACT2FN
 class RMSnorm(nn.Module):
-    def __init__(self,d_model,eps=1e-6):
+    def __init__(self,arg:MokioMindConfig) -> None:
         super().__init__()    
-        self.eps=eps
-        self.weight=nn.Parameter(torch.ones((d_model,)))  # weight是可学习的参数
+        self.eps=arg.rms_norm_eps
+        self.hidden_size=arg.hidden_size
+        self.weight=nn.Parameter(torch.ones((arg.hidden_size,)))  # weight是可学习的参数
                                                         # 要用nn.Parametes定义
     def _norm(self,x):
         return torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)*x
@@ -214,7 +215,21 @@ class attention(nn.Module):
 
 
 
-
+class FeedForward(nn.Module):
+    def __init__(self, arg:MokioMindConfig) -> None:
+        super().__init__()
+        self.hidden_size=arg.hidden_size
+        if arg.intermediate_size is None:
+            intermediate_size=int(8*arg.hidden_size/3)
+            arg.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        self.up_proj=nn.Linear(arg.hidden_size,arg.intermediate_size,bias=False)
+        self.gate_proj=nn.Linear(arg.hidden_size,arg.intermediate_size,bias=False)
+        self.down_proj=nn.Linear(arg.intermediate_size,arg.hidden_size,bias=False)
+        self.dropout=nn.Dropout(arg.dropout)
+        self.act_fn=ACT2FN[arg.hidden_act]  
+          # ACT2FN是transformers里定义的激活函数映射表
+    def forward(self,X):
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(X))*self.up_proj(X)))
 
 
 
