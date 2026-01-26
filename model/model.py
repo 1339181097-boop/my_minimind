@@ -10,6 +10,7 @@ class MokioMindConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
+        intermediate_size: int = None,
         hidden_size: int = 512,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
@@ -90,7 +91,7 @@ class RMSnorm(nn.Module):
                                                             # float32全精度更稳定，但结束后记得返回float16
 
 
-
+# 提前用非常长的end计算好cos and sin,然后切片使用
 def pre_compute_cis(end,dim,base=1e6,rope_scaling=None):
     # 先计算角频率0-dim//2个
     freqs=1.0/(base**torch.arange(0,dim,2).float()/dim)
@@ -118,8 +119,8 @@ def pre_compute_cis(end,dim,base=1e6,rope_scaling=None):
         freqs=freqs*scale
     idx_freqs=torch.outer(seq_idx,freqs)
     idx_freqs2=torch.cat([idx_freqs,idx_freqs],dim=1)
-    freqs_cos=idx_freqs2.cos()[None,:,None,:]
-    freqs_sin=idx_freqs2.sin()[None,:,None,:]
+    freqs_cos=idx_freqs2.cos().unsqueeze(0).unsqueeze(2)
+    freqs_sin=idx_freqs2.sin().unsqueeze(0).unsqueeze(2)
     return freqs_cos,freqs_sin
 
 def rota_half(x):
@@ -140,6 +141,79 @@ def repeat_kv(x,n_rep):
         x=torch.repeat_interleave(x,n_rep,dim=2)
         return x
     
+# GQA
+import torch.nn.functional as F
+import math
+class attention(nn.Module):
+    def __init__(self,arg:MokioMindConfig) -> None:
+        super().__init__()
+        self.q_heads=arg.num_attention_heads
+        self.k_v_heads=arg.num_attention_heads if arg.num_key_value_heads is None else arg.num_key_value_heads
+        assert arg.num_attention_heads%arg.num_key_value_heads==0
+        self.head_dims=arg.hidden_size//arg.num_attention_heads
+        self.n_rep=arg.num_attention_heads//arg.num_key_value_heads
+
+        self.w_q=nn.Linear(arg.hidden_size,arg.hidden_size,bias=False)
+        self.w_k=nn.Linear(arg.hidden_size,arg.head_dims*arg.num_key_value_heads,bias=False)
+        self.w_v=nn.Linear(arg.hidden_size,arg.head_dims*arg.num_key_value_heads,bias=False)
+        self.w_o=nn.Linear(arg.hidden_size,arg.hidden_size,bias=False)
+
+        self.dropout=arg.dropout
+        self.attn_dropout=nn.Dropout(arg.dropout)
+        self.restnet_dropout=nn.Dropout(arg.dropout)
+        self.flash=hasattr(torch.nn.functional,'scaled_dot_product_attention')and arg.flash_attention
+     
+     # 进来的是经过embedding层的x（batch_size,seq_len,hidden_size)
+    def forward(self,X,
+                position_embeddings,
+                past_kv=None,
+                use_cache=False,
+                attention_mask=None):
+        # 投影qkv
+        Q,K,V=self.w_q(X),self.w_k(X),self.w_v(X)
+        batch_size,seq_len,_=X.shape
+        # 分头
+        q=Q.reshape(batch_size,seq_len,self.q_heads,self.head_dims)
+        k=K.reshape(batch_size,seq_len,self.k_v_heads,self.head_dims)
+        v=V.reshape(batch_size,seq_len,self.k_v_heads,self.head_dims)
+        # q，k位置编码（先取出全部长度的cos，sin）RoPE 必须在 KV Cache 更新之前做
+        cos,sin=position_embeddings
+        q,k=apply_rotary_pos_emb(q,k,cos,sin)
+        # kv缓存
+        if past_kv is not None:
+            past_k,past_v=past_kv
+            k=torch.cat([past_k,k],dim=1)   # 拼接k，v的序列长度
+            v=torch.cat([past_v,v],dim=1)
+        # 关键修正：无论是否拼接，只要开启 use_cache，就要更新 past_kv
+        past_kv=(k,v) if use_cache else None
+        # 转置并重复k，v n_rep次
+        q=q.transpose(1,2)
+        k=repeat_kv(k,self.n_rep).transpose(1,2)
+        v=repeat_kv(v,self.n_rep).transpose(1,2)
+        # 计算注意力（因果掩码必须写q,k,v shape均为(batch_size,num_heads,seq_len,head_dim)
+        if self.flash and (seq_len > 1) and (past_kv is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            scores=torch.matmul(q,k.transpose(-2,-1))/math.sqrt(self.head_dims)
+        # 因果掩码
+            if seq_len>1:
+                tri_mask=torch.triu(torch.ones(seq_len,seq_len,device=X.device),diagonal=1)
+                scores=scores.masked_fill(tri_mask.bool(),-1e9)
+            # padding掩码(attention_mask是二维的)
+            if attention_mask is not None:
+                extended_mask=attention_mask.unsqueeze(1).unsqueeze(2) # 给pad的地方全部变成-inf
+                scores+=(1.0-extended_mask)*(-1e9)
+            attention_weights=F.softmax(scores,dim=-1)
+            attention_weights=self.attn_dropout(attention_weights)
+            output=torch.matmul(attention_weights,v)
+    # FlashAttn 和 手动计算都得到了 (b, h, s, d)，统一处理
+        # 合并头部
+        output=output.transpose(1,2).contiguous().reshape(batch_size,seq_len,-1)
+        output=self.w_o(output)
+        return self.restnet_dropout(output),past_kv
+    
+
+
 
 
 
