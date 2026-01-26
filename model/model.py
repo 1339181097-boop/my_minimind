@@ -198,11 +198,11 @@ class attention(nn.Module):
         # 因果掩码
             if seq_len>1:
                 tri_mask=torch.triu(torch.ones(seq_len,seq_len,device=X.device),diagonal=1)
-                scores=scores.masked_fill(tri_mask.bool(),-1e9)
+                scores=scores.masked_fill(tri_mask.bool(),float('-inf'))
             # padding掩码(attention_mask是二维的)
             if attention_mask is not None:
                 extended_mask=attention_mask.unsqueeze(1).unsqueeze(2) # 给pad的地方全部变成-inf
-                scores+=(1.0-extended_mask)*(-1e9)
+                scores+=(1.0-extended_mask)*(float('-inf'))
             attention_weights=F.softmax(scores,dim=-1)
             attention_weights=self.attn_dropout(attention_weights)
             output=torch.matmul(attention_weights,v)
@@ -211,7 +211,6 @@ class attention(nn.Module):
         output=output.transpose(1,2).contiguous().reshape(batch_size,seq_len,-1)
         output=self.w_o(output)
         return self.restnet_dropout(output),past_kv
-    
 
 
 
