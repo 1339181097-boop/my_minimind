@@ -11,7 +11,7 @@ class CaveManMindConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
-        intermediate_size: int = None, # pyright: ignore[reportArgumentType]
+        intermediate_size: int = None, # pyright: ignore[reportargsumentType] # type: ignore
         hidden_size: int = 512,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
@@ -32,9 +32,9 @@ class CaveManMindConfig(PretrainedConfig):
         aux_loss_alpha:float=0.1,
         seq_aux:bool=True,
         norm_topk_prob:bool=True,
-        **kwargs,
+        **kwargss,
     ):
-        super().__init__(**kwargs)
+        super().__init__(**kwargss)
 
         self.dropout = dropout
         self.bos_token_id = bos_token_id
@@ -152,23 +152,23 @@ def repeat_kv(x,n_rep):
 # GQA
 
 class Attention(nn.Module):
-    def __init__(self,arg:CaveManMindConfig) -> None:
+    def __init__(self,args:CaveManMindConfig) -> None:
         super().__init__()
-        self.q_heads=arg.num_attention_heads
-        self.k_v_heads=arg.num_attention_heads if arg.num_key_value_heads is None else arg.num_key_value_heads
-        assert arg.num_attention_heads%arg.num_key_value_heads==0
-        self.head_dims=arg.hidden_size//arg.num_attention_heads
-        self.n_rep=arg.num_attention_heads//arg.num_key_value_heads
+        self.q_heads=args.num_attention_heads
+        self.k_v_heads=args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        assert args.num_attention_heads%args.num_key_value_heads==0
+        self.head_dims=args.hidden_size//args.num_attention_heads
+        self.n_rep=args.num_attention_heads//args.num_key_value_heads
 
-        self.w_q=nn.Linear(arg.hidden_size,arg.hidden_size,bias=False)
-        self.w_k=nn.Linear(arg.hidden_size,arg.head_dims*arg.num_key_value_heads,bias=False)
-        self.w_v=nn.Linear(arg.hidden_size,arg.head_dims*arg.num_key_value_heads,bias=False)
-        self.w_o=nn.Linear(arg.hidden_size,arg.hidden_size,bias=False)
+        self.w_q=nn.Linear(args.hidden_size,args.hidden_size,bias=False)
+        self.w_k=nn.Linear(args.hidden_size,args.head_dims*args.num_key_value_heads,bias=False)
+        self.w_v=nn.Linear(args.hidden_size,args.head_dims*args.num_key_value_heads,bias=False)
+        self.w_o=nn.Linear(args.hidden_size,args.hidden_size,bias=False)
 
-        self.dropout=arg.dropout
-        self.attn_dropout=nn.Dropout(arg.dropout)
-        self.restnet_dropout=nn.Dropout(arg.dropout)
-        self.flash=hasattr(torch.nn.functional,'scaled_dot_product_attention')and arg.flash_attention
+        self.dropout=args.dropout
+        self.attn_dropout=nn.Dropout(args.dropout)
+        self.restnet_dropout=nn.Dropout(args.dropout)
+        self.flash=hasattr(torch.nn.functional,'scaled_dot_product_attention')and args.flash_attention
      
      # 进来的是经过embedding层的x（batch_size,seq_len,hidden_size)
     def forward(self,X,
@@ -223,17 +223,17 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, arg:CaveManMindConfig) -> None:
+    def __init__(self, args:CaveManMindConfig) -> None:
         super().__init__()
-        self.hidden_size=arg.hidden_size
-        if arg.intermediate_size is None:
-            intermediate_size=int(8*arg.hidden_size/3)
-            arg.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
-        self.up_proj=nn.Linear(arg.hidden_size,arg.intermediate_size,bias=False)
-        self.gate_proj=nn.Linear(arg.hidden_size,arg.intermediate_size,bias=False)
-        self.down_proj=nn.Linear(arg.intermediate_size,arg.hidden_size,bias=False)
-        self.dropout=nn.Dropout(arg.dropout)
-        self.act_fn=ACT2FN[arg.hidden_act]  
+        self.hidden_size=args.hidden_size
+        if args.intermediate_size is None:
+            intermediate_size=int(8*args.hidden_size/3)
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        self.up_proj=nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
+        self.gate_proj=nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
+        self.down_proj=nn.Linear(args.intermediate_size,args.hidden_size,bias=False)
+        self.dropout=nn.Dropout(args.dropout)
+        self.act_fn=ACT2FN[args.hidden_act]  
           # ACT2FN是transformers里定义的激活函数映射表
     def forward(self,X):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(X))*self.up_proj(X)))
@@ -306,7 +306,7 @@ class CaveManMindModel(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
                 use_cache: bool = False,
-                **kwargs   # 兼容性
+                **kwargss   # 兼容性
                 ):
         batch_size,seq_len=input_ids.shape # type: ignore
         if hasattr(past_key_values, 'layers'): past_key_values = None
@@ -344,29 +344,30 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         # 权重共享（省显存，语义对齐）
         self.model.embed_tokens.weight = self.lm_head.weight
-        self.OUT=CausalLMOutputWithPast()
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
-                **args):
+                **argss):
         hidden_states, past_key_values = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            **args
+            **argss
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", past_key_values)
+        return CausalLMOutputWithPast(
+                                        logits=logits,
+                                        past_key_values=past_key_values, # type: ignore
+                                        hidden_states=hidden_states) 
+ 
 
-        return self.OUT
+
 
 
 
