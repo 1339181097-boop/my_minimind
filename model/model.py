@@ -77,13 +77,15 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 from torch import nn
+from typing import Optional, Tuple, List, Union
 from transformers.activations import ACT2FN
+import torch.nn.functional as F
+import math
 class RMSnorm(nn.Module):
-    def __init__(self,arg:MokioMindConfig) -> None:
+    def __init__(self,dim: int, eps: float = 1e-5) -> None:
         super().__init__()    
-        self.eps=arg.rms_norm_eps
-        self.hidden_size=arg.hidden_size
-        self.weight=nn.Parameter(torch.ones((arg.hidden_size,)))  # weight是可学习的参数
+        self.eps=eps
+        self.weight=nn.Parameter(torch.ones(dim))  # weight是可学习的参数
                                                         # 要用nn.Parametes定义
     def _norm(self,x):
         return torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)*x
@@ -93,9 +95,10 @@ class RMSnorm(nn.Module):
 
 
 # 提前用非常长的end计算好cos and sin,然后切片使用
-def pre_compute_cis(end,dim,base=1e6,rope_scaling=None):
+def pre_compute_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
+                         rope_scaling: Optional[dict] = None):
     # 先计算角频率0-dim//2个
-    freqs=1.0/(base**torch.arange(0,dim,2).float()/dim)
+    freqs=1.0/(rope_base**torch.arange(0,dim,2).float()/dim)
     seq_idx=torch.arange(0,end,device=freqs.device)
     # 计算corr_dim
     if rope_scaling is not None:
@@ -134,6 +137,9 @@ def apply_rotary_pos_emb(q,k,freqs_cos,freqs_sin):
     q_embed=q*freqs_cos+rota_half(q)*freqs_sin
     k_embed=k*freqs_cos+rota_half(k)*freqs_sin
     return q_embed,k_embed
+
+
+
 # 将1/n_rep的kv重复n_rep次
 def repeat_kv(x,n_rep):
     if n_rep==1:
@@ -143,9 +149,8 @@ def repeat_kv(x,n_rep):
         return x
     
 # GQA
-import torch.nn.functional as F
-import math
-class attention(nn.Module):
+
+class Attention(nn.Module):
     def __init__(self,arg:MokioMindConfig) -> None:
         super().__init__()
         self.q_heads=arg.num_attention_heads
@@ -196,11 +201,12 @@ class attention(nn.Module):
             output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             scores=torch.matmul(q,k.transpose(-2,-1))/math.sqrt(self.head_dims)
-        # 因果掩码
-            if seq_len>1:
+        # 因果掩码（需要自己生成）
+            if seq_len>1:          # 二维即可，从右向左广播
                 tri_mask=torch.triu(torch.ones(seq_len,seq_len,device=X.device),diagonal=1)
+                # masked_fill 是 Tensor类自带的从成员方法（True表示要掩码的位置）
                 scores=scores.masked_fill(tri_mask.bool(),float('-inf'))
-            # padding掩码(attention_mask是二维的)
+            # padding掩码(attention_mask是二维的，但在四维的scores中全都一样，直接复制)
             if attention_mask is not None:
                 extended_mask=attention_mask.unsqueeze(1).unsqueeze(2) # 给pad的地方全部变成-inf
                 scores+=(1.0-extended_mask)*(float('-inf'))
@@ -235,13 +241,38 @@ class FeedForward(nn.Module):
 
 
 
+# 拼接transformerblock
+class MokioMindBlock(nn.Module):
+    def __init__(self,layer_id:int,config:MokioMindConfig) -> None:
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim=config.hidden_size//config.num_attention_heads
+        self.self_attn=Attention(config)
+        self.layer_id=layer_id
+        self.input_layernorm=RMSnorm(config.hidden_size,config.rms_norm_eps)
+        self.post_attention_layernorm=RMSnorm(config.hidden_size,config.rms_norm_eps)
+        self.mlp=FeedForward(config)
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # [关键点1] 残差连接 进入transformer的输入
+        residual = hidden_states
+        # [关键点2] Pre-Norm (前置归一化)
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+        past_key_value, use_cache, attention_mask
+
+        )
+        hidden_states = residual + hidden_states   # x+Attention(x)
 
 
+        # 第二步：MLP (FeedForward) 子层
 
+        norm_x = self.post_attention_layernorm(hidden_states)
+        mlp_out = self.mlp(norm_x)
+        hidden_states = hidden_states + mlp_out  # x + MLP(x)
 
-
-
-
+        return hidden_states, present_key_value
 
 
 
