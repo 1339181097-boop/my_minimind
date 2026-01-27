@@ -1,4 +1,5 @@
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, PreTrainedModel,GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class CaveManMindConfig(PretrainedConfig):
@@ -245,6 +246,7 @@ class FeedForward(nn.Module):
 class CaveManMindBlock(nn.Module):
     def __init__(self,layer_id:int,config:CaveManMindConfig) -> None:
         super().__init__()
+        self.config=config
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim=config.hidden_size//config.num_attention_heads
@@ -311,7 +313,7 @@ class CaveManMindModel(nn.Module):
         past_key_values = past_key_values or [None] * len(self.layers) # type: ignore
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0 # type: ignore
         hidden_states = self.dropout(self.embed_tokens(input_ids))
-        # 计算位置编码切片
+        # 计算位置编码切片（从已经计算好的非常长的cos和sin中切片）
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_len], # type: ignore
             self.freqs_sin[start_pos:start_pos + seq_len] # type: ignore
@@ -331,7 +333,40 @@ class CaveManMindModel(nn.Module):
         return hidden_states, presents
 
 
+# 封装与huggingface的接口
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = CaveManMindConfig
 
+    def __init__(self, config: CaveManMindConfig = None): # type: ignore
+        self.config = config or CaveManMindConfig()
+        super().__init__(self.config)
+        self.model = CaveManMindModel(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 权重共享（省显存，语义对齐）
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.OUT=CausalLMOutputWithPast()
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **args):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", past_key_values)
+
+        return self.OUT
 
 
 
