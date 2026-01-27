@@ -1,8 +1,8 @@
 from transformers import PretrainedConfig
 
 
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class CaveManMindConfig(PretrainedConfig):
+    model_type = "cavemanmind"
 
     def __init__(
         self,
@@ -10,7 +10,7 @@ class MokioMindConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
-        intermediate_size: int = None,
+        intermediate_size: int = None, # pyright: ignore[reportArgumentType]
         hidden_size: int = 512,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
@@ -151,7 +151,7 @@ def repeat_kv(x,n_rep):
 # GQA
 
 class Attention(nn.Module):
-    def __init__(self,arg:MokioMindConfig) -> None:
+    def __init__(self,arg:CaveManMindConfig) -> None:
         super().__init__()
         self.q_heads=arg.num_attention_heads
         self.k_v_heads=arg.num_attention_heads if arg.num_key_value_heads is None else arg.num_key_value_heads
@@ -222,7 +222,7 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, arg:MokioMindConfig) -> None:
+    def __init__(self, arg:CaveManMindConfig) -> None:
         super().__init__()
         self.hidden_size=arg.hidden_size
         if arg.intermediate_size is None:
@@ -242,8 +242,8 @@ class FeedForward(nn.Module):
 
 
 # 拼接transformerblock
-class MokioMindBlock(nn.Module):
-    def __init__(self,layer_id:int,config:MokioMindConfig) -> None:
+class CaveManMindBlock(nn.Module):
+    def __init__(self,layer_id:int,config:CaveManMindConfig) -> None:
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
@@ -273,7 +273,62 @@ class MokioMindBlock(nn.Module):
         hidden_states = hidden_states + mlp_out  # x + MLP(x)
 
         return hidden_states, present_key_value
+    
 
+class CaveManMindModel(nn.Module):
+    def __init__(self,config:CaveManMindConfig) -> None:
+        super().__init__()
+        self.config=config
+        self.vocab_size,self.num_hidden_layers=(
+            config.vocab_size,
+            config.num_hidden_layers
+        )
+        self.embed_tokens=nn.Embedding(config.vocab_size,config.hidden_size)
+        self.dropout=nn.Dropout(config.dropout)
+        self.layers=nn.ModuleList(
+            [CaveManMindBlock(i,config) for i in range(self.num_hidden_layers)]
+        )
+        self.norm=RMSnorm(config.hidden_size,config.rms_norm_eps)
+    # rope预计算（计算整个长度的cos和sin）
+        freqs_cos,freqs_sin=pre_compute_cis(
+            dim=config.hidden_size//config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling
+        )
+        # 注册参数的缓冲区
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
+                use_cache: bool = False,
+                **kwargs   # 兼容性
+                ):
+        batch_size,seq_len=input_ids.shape # type: ignore
+        if hasattr(past_key_values, 'layers'): past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.layers) # type: ignore
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0 # type: ignore
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # 计算位置编码切片
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos + seq_len], # type: ignore
+            self.freqs_sin[start_pos:start_pos + seq_len] # type: ignore
+        )
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)): # type: ignore
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, presents
 
 
 
