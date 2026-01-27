@@ -32,9 +32,9 @@ class CaveManMindConfig(PretrainedConfig):
         aux_loss_alpha:float=0.1,
         seq_aux:bool=True,
         norm_topk_prob:bool=True,
-        **kwargss,
+        **kwargs,
     ):
-        super().__init__(**kwargss)
+        super().__init__(**kwargs)
 
         self.dropout = dropout
         self.bos_token_id = bos_token_id
@@ -330,11 +330,16 @@ class CaveManMindModel(nn.Module):
             presents.append(present)
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, presents
+
+        aux_loss = sum(
+            [l.mlp.aux_loss for l in self.layers if hasattr(l.mlp, 'aux_loss')], # type: ignore
+            torch.tensor(0.0, device=hidden_states.device)
+        ) # pyright: ignore[reportCallIssue]
+        return hidden_states, presents, aux_loss
 
 
 # 封装与huggingface的接口
-class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+class CaveManMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = CaveManMindConfig
 
     def __init__(self, config: CaveManMindConfig = None): # type: ignore
@@ -347,21 +352,36 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
-                **argss):
-        hidden_states, past_key_values = self.model(
+                **kargs):
+        hidden_states, past_key_values,aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            **argss
+            **kargs
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        loss=None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous() # 扔掉最后一个
+            shift_labels = labels[:, 1:].contiguous()    # 扔掉第一个
+            logits_flat = shift_logits.view(-1, shift_logits.size(-1))
+            labels_flat=shift_labels.view(-1)
+         # CrossEntropyLoss：输入 (Input): (N, C) —— N 个样本，C 个类别，
+         # 目标 (Target): (N) —— N 个正确答案
+            loss=nn.functional.cross_entropy(logits_flat,labels_flat,ignore_index=-100)
+        # 如果你有 MoE，这个 loss 就不为 0，需要加到总 loss 里去优化
+            if aux_loss is not None:
+                loss += aux_loss
 
-        return CausalLMOutputWithPast(
+
+        return CausalLMOutputWithPast(  
+                                        loss=loss, # pyright: ignore[reportArgumentType]
                                         logits=logits,
                                         past_key_values=past_key_values, # type: ignore
                                         hidden_states=hidden_states) 
