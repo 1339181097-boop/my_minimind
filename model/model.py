@@ -41,6 +41,7 @@ class CaveManMindConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id
         self.hidden_act = hidden_act
         self.hidden_size = hidden_size
+        self.head_dims = hidden_size // num_attention_heads
         self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings
         self.num_attention_heads = num_attention_heads
