@@ -315,9 +315,11 @@ class CaveManMindModel(nn.Module):
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0 # type: ignore
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         # 计算位置编码切片（从已经计算好的非常长的cos和sin中切片）
+        # 计算位置编码切片（从已经计算好的非常长的cos和sin中切片）
+        # 修正说明：freqs_cos 形状是 [1, max_len, 1, dim]，需要切第二个维度
         position_embeddings = (
-            self.freqs_cos[start_pos:start_pos + seq_len], # type: ignore
-            self.freqs_sin[start_pos:start_pos + seq_len] # type: ignore
+            self.freqs_cos[:, start_pos:start_pos + seq_len, :, :],  # type: ignore
+            self.freqs_sin[:, start_pos:start_pos + seq_len, :, :]  # type: ignore
         )
         presents = []
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)): # type: ignore
@@ -381,12 +383,13 @@ class CaveManMindForCausalLM(PreTrainedModel, GenerationMixin):
                 loss += aux_loss
 
 
-        return CausalLMOutputWithPast(  
+        output=CausalLMOutputWithPast(  
                                         loss=loss, # pyright: ignore[reportArgumentType]
                                         logits=logits,
                                         past_key_values=past_key_values, # type: ignore
                                         hidden_states=hidden_states) 
- 
+        output.aux_loss = aux_loss
+        return output
 
 
 
