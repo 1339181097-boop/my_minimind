@@ -106,7 +106,8 @@ def lm_checkpoint(
             saved_ws = ckp_data.get("world_size", 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
 # Global Batch Size (GBS)
-#  = micro_batch_size * grad_accum_steps * world_size (卡数)
+#  = micro_batch_size（单卡bz） * grad_accum_steps * world_size (卡数)
+# 体现了Global Batch Size不变性原理
             if saved_ws != current_ws:
                 ckp_data["step"] = ckp_data["step"] * saved_ws // current_ws
                 Logger(
@@ -133,7 +134,7 @@ def init_model(
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(current_dir)
         tokenizer_path = os.path.join(project_root, "model")
-
+# 分词器和模型绑定在一起
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     model = CaveManMindForCausalLM(lm_config)
