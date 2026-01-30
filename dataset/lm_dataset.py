@@ -6,43 +6,23 @@ import json
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-class PretrainedDataset(Dataset): # 产出：Tensor([512]) —— 这是一个一维向量
+class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(data_path)
-
-    def load_data(self, path):
-        samples = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                # 提取每一行内容放到sample
-                data = json.loads(line.strip())
-                samples.append(data)
-        return samples
+        self.samples = load_dataset('json', data_files=data_path, split='train')
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) # type: ignore
 
     def __getitem__(self, index):
-        sample = self.samples[index]
-        # 用tokenizer进行编码
-        # 超过max_length的截断，不到的填充
-        encoding = self.tokenizer(
-            str(sample["text"]),
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        input_ids = encoding.input_ids.squeeze()
-        # 忽略padding产生的Y
-        loss_mask = input_ids != self.tokenizer.pad_token_id
-        # X,Y无需错位，model会错位
-        X = torch.tensor(input_ids, dtype=torch.long)
-        Y = torch.tensor(input_ids, dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask, dtype=torch.long)
-        return X, Y, loss_mask
+        sample = self.samples[index] # type: ignore
+        tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        labels = input_ids.clone()
+        labels[input_ids == self.tokenizer.pad_token_id] = -100
+        return input_ids, labels
     
