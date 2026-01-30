@@ -105,7 +105,8 @@ def lm_checkpoint(
             ckp_data = torch.load(resume_path, map_location="cpu")
             saved_ws = ckp_data.get("world_size", 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
-
+# Global Batch Size (GBS)
+#  = micro_batch_size * grad_accum_steps * world_size (卡数)
             if saved_ws != current_ws:
                 ckp_data["step"] = ckp_data["step"] * saved_ws // current_ws
                 Logger(
@@ -124,7 +125,7 @@ def init_model(
     device="cuda",
 ):
     from transformers import AutoTokenizer
-    from model.model import CaveManMindForCausalLM
+    from model.model_base import CaveManMindForCausalLM
 
     # 如果没有指定 tokenizer_path，使用项目根目录下的 model 文件夹
     if tokenizer_path is None:
@@ -154,7 +155,7 @@ def init_model(
 
     return model.to(device), tokenizer
 
-# 断点续训的数据采样器,“防止重启训练时数据重复”
+# 断点续训的数据采样器,“防止重启训练时数据重复” (重要！)
 class SkipBatchSampler(Sampler):
     def __init__(self, sampler, batch_size, skip_batches=0):
         self.sampler = sampler  #

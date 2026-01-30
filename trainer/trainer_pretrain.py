@@ -15,8 +15,8 @@ from torch import optim, nn  # 优化器和神经网络模块
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
 
-from model.model import CaveManMindConfig 
-from dataset.lm_dataset import PretrainedDataset
+from model.model_base import CaveManMindConfig 
+from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import (  # 训练工具函数
     get_lr,
     Logger,
@@ -32,55 +32,47 @@ from trainer.trainer_utils import (  # 训练工具函数
 warnings.filterwarnings("ignore")
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
-    start_time = time.time()  # 记录开始时间
-
-    # 遍历数据批次
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+    # 1. 这里不需要定义 loss_fct 了，因为模型内部已经集成了 CrossEntropyLoss
+    start_time = time.time()
+    
+    # 2. 修改循环解包：只接收 X 和 Y (去掉了 loss_mask)
+    for step, (X, Y) in enumerate(loader, start=start_step + 1):
         X = X.to(args.device)
         Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+        # loss_mask 也不需要了，因为 Y 里的 -100 已经起到了 mask 的作用
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
         with autocast_ctx:
-            # 前向传播
-            res = model(X)
+            # 3. 核心修改：将 Y 作为 labels 传给模型
+            # 这样模型内部的 forward 会自动执行：
+            #   a. 错位切片 (Shift)
+            #   b. 计算交叉熵 (自动忽略 -100)
+            #   c. 加上 aux_loss (如果有 MoE)
+            res = model(input_ids=X, labels=Y)
 
-            loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),  # [batch*seq, vocab_size]
-                Y.view(-1),  # [batch*seq]
-            ).view(Y.size())  # 恢复为 [batch_size, seq_len]
-
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-
-            loss+=res.aux_loss
+            # 4. 直接获取总 loss
+            loss = res.loss
             
+            # 注意：res.loss 内部已经包含了 res.aux_loss，不要重复相加！
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
-            # scaler.unscale_(): 还原梯度的真实值
             scaler.unscale_(optimizer)
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            # 📚 优化器更新知识点
-            # scaler.step(): 执行参数更新
-            # scaler.update(): 更新scaler的缩放因子
             scaler.step(optimizer)
             scaler.update()
-
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
-            current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
+            current_loss = loss.item() * args.accumulation_steps
+            current_lr = optimizer.param_groups[-1]["lr"]
 
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
@@ -88,34 +80,24 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
             )
 
-            # 记录到实验跟踪系统
             if wandb:
                 wandb.log(
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
-            model.eval()  # 切换到评估模式
-
-            # 构建保存路径
-            moe_suffix = (
-                "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
-            )
+            model.eval()
+            moe_suffix = "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-            # 📚 分布式模型保存知识点
-            # DDP模型需要通过.module访问真正的模型
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
 
-            # 📚 半精度保存知识点
-            # 将float32参数转为float16，减少存储空间
             state_dict = {k: v.half() for k, v in state_dict.items()}
             torch.save(state_dict, ckp)
 
-            # 保存完整训练状态
             lm_checkpoint(
                 lm_config,
                 weight=args.save_weight,
@@ -128,7 +110,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 save_dir="checkpoints",
             )
 
-            model.train()  # 恢复训练模式
+            model.train()
 
 
 
@@ -299,7 +281,7 @@ if __name__ == "__main__":
     # 初始化模型和分词器
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 
-    train_ds = PretrainedDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 
