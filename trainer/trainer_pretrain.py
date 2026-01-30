@@ -35,7 +35,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     # 1. 这里不需要定义 loss_fct 了，因为模型内部已经集成了 CrossEntropyLoss
     start_time = time.time()
     
-    # 2. 修改循环解包：只接收 X 和 Y (去掉了 loss_mask)
+    # 2. 修改循环解包：只接收 X 和 Y
     for step, (X, Y) in enumerate(loader, start=start_step + 1):
         X = X.to(args.device)
         Y = Y.to(args.device)
