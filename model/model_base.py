@@ -126,7 +126,7 @@ def pre_compute_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
     idx_freqs=torch.outer(seq_idx,freqs)
     idx_freqs2=torch.cat([idx_freqs,idx_freqs],dim=1)
     freqs_cos=idx_freqs2.cos().unsqueeze(0).unsqueeze(2)
-    freqs_sin=idx_freqs2.sin().unsqueeze(0).unsqueeze(2)
+    freqs_sin=idx_freqs2.sin().unsqueeze(0).unsqueeze(2)# (batch_size,seq_len,self.q_heads,self.head_dims)
     return freqs_cos,freqs_sin # 用于分完头的q，k位置编码
 
 def rota_half(x):
@@ -195,7 +195,7 @@ class Attention(nn.Module):
             k=torch.cat([past_k,k],dim=1)   # 拼接k，v的序列长度
             v=torch.cat([past_v,v],dim=1)
         # 无论是否拼接，只要开启 use_cache，就要更新 past_kv
-        past_kv=(k,v) if use_cache else None
+        past_kv=(k,v) if use_cache else None   # (batch_size,seq_len,self.k_v_heads,self.head_dims)
         # 转置并重复k，v n_rep次
         q=q.transpose(1,2)
         k=repeat_kv(k,self.n_rep).transpose(1,2)
@@ -226,7 +226,7 @@ class Attention(nn.Module):
         # 合并头部
         output=output.transpose(1,2).contiguous().reshape(batch_size,seq_len,-1)
         output=self.w_o(output)
-        return self.restnet_dropout(output),past_kv
+        return self.restnet_dropout(output),past_kv # 更新完的kvcache
 
 
 
@@ -323,7 +323,7 @@ class CaveManMindModel(nn.Module):
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         # 计算位置编码切片（从已经计算好的非常长的cos和sin中切片）
         # 计算位置编码切片（从已经计算好的非常长的cos和sin中切片）
-        # 修正说明：freqs_cos 形状是 [1, max_len, 1, dim]，需要切第二个维度
+        # freqs_cos 形状是 [1, max_len, 1, dim]，需要切第二个维度
         position_embeddings = (
             self.freqs_cos[:, start_pos:start_pos + seq_len, :, :],  # type: ignore
             self.freqs_sin[:, start_pos:start_pos + seq_len, :, :]  # type: ignore
