@@ -30,3 +30,102 @@ class PretrainDataset(Dataset):
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
     
+
+
+class SFTDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer  # 传入的分词器，用于将文本转为数字
+        self.max_length = max_length # 序列最大长度，超过截断，不足补0
+        # 加载数据：从jsonl文件中读取训练数据，split='train'表示读取训练集
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train')
+        
+        # === 核心逻辑：定义“信号提取”的特征码 ===
+        # bos_id: 并不是简单的bos_token，而是构造了 '<s>assistant\n' 这样的序列
+        # 这意味着：模型看到这个标志，就知道“轮到我（助手）说话了”，这是计算Loss的起点特征。
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        
+        # eos_id: 构造 '</s>\n' 这样的序列
+        # 这意味着：模型看到这个标志，就知道“这句话说完了”，这是计算Loss的终点特征。
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+
+    def create_chat_prompt(self, cs):
+        # cs 是 conversation 列表，例如 [{'role': 'user', 'content': '...'}, {'role': 'assistant', ...}]
+        messages = cs.copy()
+        # 检查是否有 function calling（工具调用）的定义，通常医药大模型需要挂载知识库查询工具
+        tools = cs[0]["functions"] if (cs and cs[0]["role"] == "system" and cs[0].get("functions")) else None
+        
+        # === 核心逻辑：应用聊天模板 ===
+        # 这一行非常关键。它利用 tokenizer 内部定义的 Jinja2 模板，将 list 格式的对话
+        # 自动拼接成一个长字符串。例如：
+        # "<|user|>\n你好<|end|>\n<|assistant|>\n你好，请问有什么帮您？<|end|>"
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,            # 这里先不转数字，只拼字符串
+            add_generation_prompt=False, # 训练时不需要添加生成的引导符
+            tools=tools
+        )
+    
+    def generate_labels(self, input_ids):
+        # 1. 初始化标签：全为 -100
+        # 在 PyTorch 的 CrossEntropyLoss 中，ignore_index 默认为 -100。
+        # 意味着标签为 -100 的位置，不计算 Loss，不进行反向传播。
+        labels = [-100] * len(input_ids)
+        
+        i = 0
+        while i < len(input_ids):
+            # 2. 寻找回答的起点（帧头检测）
+            # 遍历 input_ids，寻找是否匹配 self.bos_id（即 '<s>assistant\n'）
+            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                start = i + len(self.bos_id) # 真正需要学习的内容，是从 'assistant\n' 之后开始的
+                end = start
+                
+                # 3. 寻找回答的终点（帧尾检测）
+                while end < len(input_ids):
+                    # 寻找 self.eos_id（即 '</s>\n'）
+                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        break
+                    end += 1
+                
+                # 4. 填充有效标签（Payload 解调）
+                # 将 input_ids 中 [start, end] 这一段复制给 labels
+                # 这一段就是模型应该输出的“正确答案”
+                # 注意：min(..., self.max_length) 是防止越界
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                    labels[j] = input_ids[j]
+                
+                # 更新指针，继续寻找下一轮对话（如果是多轮对话，会有多个 user/assistant 交互）
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            else:
+                i += 1
+        return labels
+
+    def __getitem__(self, index):
+        sample = self.samples[index] # type: ignore # 取出一条原始数据
+        prompt = self.create_chat_prompt(sample['conversations']) # 1. 格式化成字符串
+        
+        # 2. 分词（Tokenization）
+        # 将字符串转为数字列表，并强制截断到 max_length
+        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        
+        # 3. Padding（补齐）
+        # 如果长度不够 max_length，后面补 pad_token_id (通常是0)
+        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        
+        # 4. 生成对应的标签（调用上面的核心函数）
+        labels = self.generate_labels(input_ids)
+        
+        # 5. 返回 Tensor
+        # input_ids: 模型的输入 X
+        # labels:    模型的监督信号 Y (其中 -100 的地方被 Mask 掉了)
+        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+            #  Assistant 既在输入里（作为背景上下文），也在 Label 里（作为考试标准）
+
+
+
+
+
+
+
+
+
