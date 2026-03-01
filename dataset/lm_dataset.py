@@ -24,7 +24,7 @@ class PretrainDataset(Dataset):
         # pad为还没到达最大长度的部分
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
-        # shift在model里进行
+        # label相较于input_ids shift一位在model里进行
         labels = input_ids.clone()
         # pad填上-100，计算loss时自动忽略
         labels[input_ids == self.tokenizer.pad_token_id] = -100
@@ -48,7 +48,8 @@ class SFTDataset(Dataset):
         # eos_id: 构造 '</s>\n' 这样的序列
         # 这意味着：模型看到这个标志，就知道“这句话说完了”，这是计算Loss的终点特征。
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
-
+    def __len__(self):
+        return len(self.samples)
     def create_chat_prompt(self, cs):
         # cs 是 conversation 列表，例如 [{'role': 'user', 'content': '...'}, {'role': 'assistant', ...}]
         messages = cs.copy()
@@ -66,6 +67,7 @@ class SFTDataset(Dataset):
             tools=tools
         )
     
+    # 将label仅设为assistant回答部分
     def generate_labels(self, input_ids):
         # 1. 初始化标签：全为 -100
         # 在 PyTorch 的 CrossEntropyLoss 中，ignore_index 默认为 -100。
@@ -73,7 +75,7 @@ class SFTDataset(Dataset):
         labels = [-100] * len(input_ids)
         
         i = 0
-        while i < len(input_ids):
+        while i < len(input_ids): 
             # 2. 寻找回答的起点（帧头检测）
             # 遍历 input_ids，寻找是否匹配 self.bos_id（即 '<s>assistant\n'）
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
