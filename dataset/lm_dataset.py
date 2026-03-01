@@ -49,7 +49,7 @@ class SFTDataset(Dataset):
         # 这意味着：模型看到这个标志，就知道“这句话说完了”，这是计算Loss的终点特征。
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) # type: ignore
     def create_chat_prompt(self, cs):
         # cs 是 conversation 列表，例如 [{'role': 'user', 'content': '...'}, {'role': 'assistant', ...}]
         messages = cs.copy()
@@ -123,7 +123,81 @@ class SFTDataset(Dataset):
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
             #  Assistant 既在输入里（作为背景上下文），也在 Label 里（作为考试标准）
 
+class DPODataset(Dataset):
+    def __init__(self, file_path, tokenizer, max_length=4096):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        # 获取 assistant 专属的起始和结束 Token ID，用于后续精确匹配并定位回复内容的边界
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+        self.data = load_dataset('json', data_files=file_path, split='train')
 
+    def __len__(self):
+        return len(self.data) # type: ignore
+
+    def __getitem__(self, index):
+        item = self.data[index] # type: ignore
+        chosen = item['chosen']  # 是一个 list，里面包含若干 {role, content}
+        rejected = item['rejected']  # 同上
+        # 利用 tokenizer 内置的聊天模板，将字典格式的对话拼接成标准字符串格式。tokenize=False 表示暂不转 ID。
+        chosen_prompt = self.tokenizer.apply_chat_template(
+            chosen, tokenize=False, add_generation_prompt=False
+        )
+        # 符合对话模板的字符串
+        rejected_prompt = self.tokenizer.apply_chat_template(
+            rejected, tokenize=False, add_generation_prompt=False
+        )
+        # 将拼接好的字符串进行 Tokenize，统一截断/填充到 max_length
+        chosen_encoding = self.tokenizer(
+            chosen_prompt, truncation=True, max_length=self.max_length, padding='max_length'
+        )
+        rejected_encoding = self.tokenizer(
+            rejected_prompt, truncation=True, max_length=self.max_length, padding='max_length'
+        )
+        
+        chosen_input_ids = chosen_encoding['input_ids']
+        # 核心：生成掩码，区分“指令/问题”与“模型回复”。
+        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
+
+        rejected_input_ids = rejected_encoding['input_ids']
+        rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+        # 输入序列舍去最后一个，标签序列去掉第一个，mask与标签同样的处理
+        x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
+        y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
+        mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
+        x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
+        y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
+        mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
+
+        return {
+            'x_chosen': x_chosen,
+            'y_chosen': y_chosen,
+            'mask_chosen': mask_chosen,
+            'x_rejected': x_rejected,
+            'y_rejected': y_rejected,
+            'mask_rejected': mask_rejected
+        }
+
+    def generate_loss_mask(self, input_ids):
+        # 全部用0填充，只有assistant回复的部分才标记为1，表示这些位置需要计算Loss
+        loss_mask = [0] * len(input_ids)     
+        i = 0
+        while i < len(input_ids):
+            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                start = i + len(self.bos_id)
+                end = start
+                while end < len(input_ids):
+                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        break
+                    end += 1
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                    loss_mask[j] = 1
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            else:
+                i += 1
+        return loss_mask
 
 
 
